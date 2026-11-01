@@ -5,7 +5,8 @@ import type {SessionConfig} from "./CodexAcpClient";
 import type {CodexAppServerClient} from "./CodexAppServerClient";
 import type {ModeKind} from "./app-server/ModeKind";
 import type {ServiceTier} from "./app-server/ServiceTier";
-import type {Model} from "./app-server/v2";
+import type {Model, Thread, ThreadForkResponse} from "./app-server/v2";
+import {isMissingRolloutError} from "./CodexThreadErrors";
 import type {SessionMetadata} from "./SessionMetadata";
 import type {AcpMcpServer, WithAcpMcpServers} from "./McpServerConfig";
 import type {SessionInstructions} from "./ClientSystemPrompt";
@@ -41,15 +42,42 @@ export async function forkSession(
         additionalDirectories,
         request.mcpServers ?? [],
     );
-    const response = await dependencies.codexClient.threadFork({
-        excludeTurns: true,
-        config: sessionConfig.config,
-        cwd: request.cwd,
-        ...(lastTurnId !== undefined && {lastTurnId}),
-        modelProvider: await dependencies.getResumeModelProvider(),
-        threadId: request.sessionId,
-        ...(instructions?.text !== undefined ? {developerInstructions: instructions.developerInstructions} : {}),
-    });
+    const modelProvider = await dependencies.getResumeModelProvider();
+    const developerInstructions = instructions?.text !== undefined
+        ? {developerInstructions: instructions.developerInstructions}
+        : {};
+    let response: ThreadForkResponse;
+    try {
+        response = await dependencies.codexClient.threadFork({
+            excludeTurns: true,
+            config: sessionConfig.config,
+            cwd: request.cwd,
+            ...(lastTurnId !== undefined && {lastTurnId}),
+            modelProvider,
+            threadId: request.sessionId,
+            ...developerInstructions,
+        });
+    } catch (err) {
+        if (!isMissingRolloutError(err)) throw err;
+        // Codex writes a thread's rollout on its first prompt, and `thread/fork` copies that rollout. A live thread
+        // that was never prompted has nothing to copy, so its fork is a new thread with the same model.
+        let source: Thread;
+        try {
+            source = (await dependencies.codexClient.threadRead({threadId: request.sessionId})).thread;
+        } catch {
+            throw err;
+        }
+        response = await dependencies.codexClient.threadStart({
+            config: {
+                ...sessionConfig.config,
+                ...(source.model !== null && {model: source.model}),
+                ...(source.reasoningEffort !== null && {model_reasoning_effort: source.reasoningEffort}),
+            },
+            cwd: request.cwd,
+            modelProvider,
+            ...developerInstructions,
+        });
+    }
     dependencies.forkCreated(response.thread.id);
     // `thread/fork` subscribes this connection to the new thread, and only to it: the source thread keeps the
     // subscription it had. The fork stays subscribed, as ACP lets the client prompt it at once. Codex keeps an

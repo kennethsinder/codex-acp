@@ -114,6 +114,46 @@ describe("sessions Codex has not materialized on disk", () => {
         expect(appServer.threadRead).not.toHaveBeenCalled();
     });
 
+    it("forks a never-prompted thread as a new thread with the same model", async () => {
+        const {fixture, appServer} = createFixture();
+        const forkId = "01a0c48a-fc81-7b33-8d61-f4e2fd7c9b9a";
+        appServer.threadFork = vi.fn().mockRejectedValue(NO_ROLLOUT(threadId));
+        appServer.threadRead = vi.fn().mockResolvedValue({thread: createLiveThread()});
+        appServer.threadStart = vi.fn().mockResolvedValue({
+            thread: {...createLiveThread(), id: forkId, sessionId: forkId},
+            model: "model-id",
+            modelProvider: "openai",
+            reasoningEffort: "medium",
+            serviceTier: null,
+        });
+
+        const response = await fixture.getCodexAcpAgent().forkSession({
+            sessionId: threadId,
+            cwd: "/test/cwd",
+            mcpServers: [],
+        });
+
+        expect(response.sessionId).toBe(forkId);
+        expect(appServer.threadStart).toHaveBeenCalledWith(expect.objectContaining({
+            cwd: "/test/cwd",
+            config: expect.objectContaining({model: "model-id", model_reasoning_effort: "medium"}),
+        }));
+    });
+
+    it("keeps failing a fork of a thread id Codex has never seen", async () => {
+        const {fixture, appServer} = createFixture();
+        appServer.threadFork = vi.fn().mockRejectedValue(NO_ROLLOUT(threadId));
+        appServer.threadRead = vi.fn().mockRejectedValue(new Error(`thread not loaded: ${threadId}`));
+        appServer.threadStart = vi.fn();
+
+        await expect(fixture.getCodexAcpAgent().forkSession({
+            sessionId: threadId,
+            cwd: "/test/cwd",
+            mcpServers: [],
+        })).rejects.toThrow("no rollout found for thread id");
+        expect(appServer.threadStart).not.toHaveBeenCalled();
+    });
+
     it("deletes a session that has no persisted rollout", async () => {
         const {fixture, appServer} = createFixture();
         appServer.threadArchive = vi.fn().mockRejectedValue(NO_ROLLOUT(threadId));
